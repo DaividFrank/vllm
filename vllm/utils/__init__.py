@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import asyncio
+from copy import deepcopy
 import concurrent
 import contextlib
 import datetime
@@ -1980,7 +1981,8 @@ class FlexibleArgumentParser(ArgumentParser):
 
         file_path = args[index + 1]
 
-        config_args = self.load_config_file(file_path)
+        config = self._resolve_config(file_path)
+        config_args = self._convert_config_to_args(config)
 
         # 0th index might be the sub command {serve,chat,complete,...}
         # optionally followed by model_tag (only for serve)
@@ -2014,38 +2016,9 @@ class FlexibleArgumentParser(ArgumentParser):
 
         return args
 
-    def load_config_file(self, file_path: str) -> list[str]:
-        """Loads a yaml file and returns the key value pairs as a
-        flattened list with argparse like pattern
-        ```yaml
-            port: 12323
-            tensor-parallel-size: 4
-        ```
-        returns:
-            processed_args: list[str] = [
-                '--port': '12323',
-                '--tensor-parallel-size': '4'
-            ]
-        """
-        extension: str = file_path.split('.')[-1]
-        if extension not in ('yaml', 'yml'):
-            raise ValueError(
-                "Config file must be of a yaml/yml type.\
-                              %s supplied", extension)
-
-        # only expecting a flat dictionary of atomic types
+    def _convert_config_to_args(self, config: dict[str,
+                                                   int | str]) -> list[str]:
         processed_args: list[str] = []
-
-        config: dict[str, Union[int, str]] = {}
-        try:
-            with open(file_path) as config_file:
-                config = yaml.safe_load(config_file)
-        except Exception as ex:
-            logger.error(
-                "Unable to read the config file at %s. \
-                Make sure path is correct", file_path)
-            raise ex
-
         store_boolean_arguments = [
             action.dest for action in self._actions
             if isinstance(action, StoreBoolean)
@@ -2066,6 +2039,80 @@ class FlexibleArgumentParser(ArgumentParser):
 
         return processed_args
 
+    def _resolve_config(self, file_path: str) -> dict[str, int | str]:
+        """Loads and merges yaml files based on 'extends' key.
+        if base.yaml contains:
+        ```yaml
+            port: 12321
+            model: LLaMA-7B
+        ```
+        and file_path.yaml contains:
+        ```yaml
+            extends: base.yaml
+            port: 12323
+            tensor-parallel-size: 4
+        ```
+        returns:
+        ```dict{
+            "port": 12323,
+            "model': "LLaMA-7B",
+            "tensor-parallel-size": 4,
+        }
+        ```
+        """
+        # Use a stack to hold the configs in the correct order for merging
+        config_stack = []
+        current_path = os.path.abspath(file_path)
+
+        while current_path:
+            extension: str = current_path.split('.')[-1]
+            if extension not in ('yaml', 'yml'):
+                raise ValueError(
+                    f"Config file must be of a yaml/yml type. Found: {extension}"
+                )
+
+            try:
+                with open(current_path, 'r') as config_file:
+                    current_config = yaml.safe_load(config_file)
+            except Exception as ex:
+                logger.error(
+                    "Unable to read the config file at %s. Make sure the path is correct.",
+                    current_path)
+                raise ex
+
+            config_stack.append(current_config)
+
+            # Check for the 'extends' key to find the parent config
+            if 'extends' in current_config:
+                parent_path = os.path.join(os.path.dirname(current_path),
+                                           current_config['extends'])
+                current_path = os.path.abspath(parent_path)
+            else:
+                current_path = None
+
+        if not config_stack:
+            return {}
+
+        # Merge the configs from the bottom up (base to child)
+        config = config_stack.pop()
+        while config_stack:
+            child_config = config_stack.pop()
+            # Remove the 'extends' key before merging to not override parent's extends
+            if 'extends' in child_config:
+                del child_config['extends']
+            self._deep_merge_dicts(config, child_config)
+
+        return config
+
+    def _deep_merge_dicts(self, a: dict, b: dict) -> dict:
+        result = deepcopy(a)
+        for bk, bv in b.items():
+            av = result.get(bk)
+            if isinstance(av, dict) and isinstance(bv, dict):
+                result[bk] = self._deep_merge_dicts(av, bv)
+            else:
+                result[bk] = deepcopy(bv)
+        return result
 
 async def _run_task_with_lock(task: Callable, lock: asyncio.Lock, *args,
                               **kwargs):
